@@ -2,7 +2,7 @@ package commands
 
 import (
    // Logger
-	log "github.com/sirupsen/logrus"
+   log "github.com/sirupsen/logrus"
 
    "github.com/spf13/cobra"
 )
@@ -23,7 +23,7 @@ say
 */
 
 func init() {
-   rootCmd.AddCommand(checkLandbCmd)
+   rootCmd.AddCommand(checkLandbCmd, updateLandbCmd)
 }
 
 func Execute() {
