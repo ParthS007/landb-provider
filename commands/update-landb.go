@@ -1,20 +1,79 @@
 package commands
 
 import (
+	"crypto/tls"
 	"fmt"
 	"time"
 	"strings"
 	"regexp"
 	"sort"
+    "net/http"
+	"sync"
+	"gopkg.in/gcfg.v1"
 
 	// Logger
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+    "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	//// OpenStack Authentication
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
+    "github.com/gophercloud/gophercloud/openstack"
+    "github.com/gophercloud/gophercloud/openstack/identity/v3/extensions/trusts"
+
+	//// Kubernetes
+	v1Type "k8s.io/api/core/v1"
+	netutil "k8s.io/apimachinery/pkg/util/net"
+	certutil "k8s.io/client-go/util/cert"
 )
+
+// LandbProvider stores the OS and Kubernetes conn handles and options
+type LandbProvider struct {
+	// NumIngressNodes is the number of ingress instances to be kept active
+	NumIngressNodes int
+
+	// CloudConfig is the location of the openstack cloud config
+	CloudConfig  string
+	config       *rest.Config
+	clientset    *kubernetes.Clientset
+	osProvider   *gophercloud.ProviderClient
+	serverClient *gophercloud.ServiceClient
+}
+
+type stateData struct {
+	// Lock
+	mutex *sync.Mutex
+	// Kubernetes
+	roleIngressNodes    []v1Type.Node
+
+	// Defined aliases (only hostname)
+	aliases []string
+}
+
+// Config is used to read and store information from the cloud configuration file
+type Config struct {
+	Global struct {
+		AuthURL         string `gcfg:"auth-url"`
+		Username        string
+		UserID          string `gcfg:"user-id"`
+		Password        string
+		TenantID        string `gcfg:"tenant-id"`
+		TenantName      string `gcfg:"tenant-name"`
+		TrustID         string `gcfg:"trust-id"`
+		DomainID        string `gcfg:"domain-id"`
+		DomainName      string `gcfg:"domain-name"`
+		Region          string
+		CAFile          string `gcfg:"ca-file"`
+		SecretName      string `gcfg:"secret-name"`
+		SecretNamespace string `gcfg:"secret-namespace"`
+		KubeconfigPath  string `gcfg:"kubeconfig-path"`
+	}
+}
+
+var cluster stateData
+var d LandbProvider
 
 var updateLandbCmd = &cobra.Command{
 	Use:   "update-landb",
@@ -31,10 +90,72 @@ var updateLandbCmd = &cobra.Command{
 	},
 }
 
+// Init sets all the required clients to talk to openstack
+func (d *LandbProvider) Init() {
+	// init Lock
+	cluster.mutex = &sync.Mutex{}
+
+	// ////////////////////////////////// K8s Config
+	// get K8s config
+	var err error
+	d.config, err = rest.InClusterConfig()
+	if err != nil {
+		log.Fatalf("Could not get Kubernetes configuration options: %v", err)
+	}
+	// creates the clientset
+	d.clientset, err = kubernetes.NewForConfig(d.config)
+	if err != nil {
+		log.Fatalf("Could not create the client set to comunicate with the Kubernetes engine: %v", err)
+	}
+
+	// ////////////////////////////////// OS Config
+	// HACK: This package (Config) comes from providerOpenStack.go to fix
+	// 				the apimachinery dependencies headache
+	var cfg Config
+	if err := gcfg.ReadFileInto(&cfg, d.CloudConfig); err != nil {
+		log.Fatalf("Could not get OpenStack configuration file: %v", err)
+	}
+
+	// HACK: This package (toAuthOptsExt) comes from providerOpenStack.go to fix
+	// 				the apimachinery dependencies headache
+	authOpts := toAuthOptsExt(cfg)
+
+	d.osProvider, err = openstack.NewClient(cfg.Global.AuthURL)
+	if err != nil {
+		log.Fatalf("Could not authenticate client: %v", err)
+	}
+
+	if cfg.Global.CAFile != "" {
+		roots, err := certutil.NewPool(cfg.Global.CAFile)
+		if err != nil {
+			log.Fatalf("Could not create new Certificate Pool: %v", err)
+		}
+		config := &tls.Config{}
+		config.RootCAs = roots
+		d.osProvider.HTTPClient.Transport = netutil.SetOldTransportDefaults(&http.Transport{TLSClientConfig: config})
+
+	}
+
+	userAgent := gophercloud.UserAgent{}
+	userAgent.Prepend(fmt.Sprintf("landb-provider/unreleased"))
+	log.Infof("user-agent: %s", userAgent.Join())
+	d.osProvider.UserAgent = userAgent
+
+	err = openstack.AuthenticateV3(d.osProvider, authOpts, gophercloud.EndpointOpts{})
+	if err != nil {
+		log.Fatalf("Could not authenticate: %v", err)
+	}
+
+	d.serverClient, err = openstack.NewComputeV2(d.osProvider, gophercloud.EndpointOpts{Region: cfg.Global.Region})
+	if err != nil {
+		log.Fatalf("Could not get client for the to interact with Server API: %v", err)
+	}
+}
 
 // Method to update/delete the Landb alias
 func UpdateLandbRecord(cluster *stateData, kubernetesAliases []string, kubernetesDeletedAliases []string) error {
-	var d *LandbProvider
+    d.Init()
+
     if len(cluster.roleIngressNodes) == 0 {
 		log.Info("There are no available ingress nodes on the cluster where to add/del landb-alias. Nothing to do.")
 		return nil
@@ -236,4 +357,25 @@ func RemoveDuplicatesFromSlice(s []string) []string {
 		result = append(result, item)
 	}
 	return result
+}
+
+func toAuthOptsExt(cfg Config) trusts.AuthOptsExt {
+	opts := gophercloud.AuthOptions{
+		IdentityEndpoint: cfg.Global.AuthURL,
+		Username:         cfg.Global.Username,
+		UserID:           cfg.Global.UserID,
+		Password:         cfg.Global.Password,
+		TenantID:         cfg.Global.TenantID,
+		TenantName:       cfg.Global.TenantName,
+		DomainID:         cfg.Global.DomainID,
+		DomainName:       cfg.Global.DomainName,
+
+		// Persistent service, so we need to be able to renew tokens.
+		AllowReauth: true,
+	}
+
+	return trusts.AuthOptsExt{
+		TrustID:            cfg.Global.TrustID,
+		AuthOptionsBuilder: &opts,
+	}
 }
